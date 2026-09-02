@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>История аккаунтов</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #0f1115);
+    --text: var(--tg-theme-text-color, #ffffff);
+    --hint: var(--tg-theme-hint-color, #8a8f98);
+    --card: var(--tg-theme-secondary-bg-color, #1b1e25);
+    --link: var(--tg-theme-link-color, #6ab7ff);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 12px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  h1 {
+    font-size: 18px;
+    margin: 4px 0 14px;
+  }
+  .empty, .loading {
+    color: var(--hint);
+    text-align: center;
+    padding: 40px 10px;
+  }
+  .card {
+    background: var(--card);
+    border-radius: 14px;
+    padding: 14px 16px;
+    margin-bottom: 10px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+  }
+  .card-title {
+    font-weight: 600;
+    font-size: 15px;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .row {
+    font-size: 14px;
+    color: var(--text);
+    opacity: 0.92;
+    margin: 2px 0;
+    word-break: break-all;
+  }
+  .row b { opacity: 0.7; font-weight: 500; }
+  .meta {
+    margin-top: 8px;
+    font-size: 12.5px;
+    color: var(--hint);
+    display: flex;
+    justify-content: space-between;
+  }
+  .badge-added { color: #3ddc84; }
+  .badge-deleted { color: #ff5c5c; }
+  .badge-taken { color: #ffb84d; }
+  .badge-returned { color: #6ab7ff; }
+</style>
+</head>
+<body>
+  <h1>📖 История аккаунтов</h1>
+  <div id="content" class="loading">Загрузка…</div>
+
+<script>
+  const tg = window.Telegram ? window.Telegram.WebApp : null;
+  if (tg) { tg.ready(); tg.expand(); }
+
+  const ICONS = { added: "🟢", deleted: "🔴", taken: "📤", returned: "📥" };
+  const CLASSES = { added: "badge-added", deleted: "badge-deleted", taken: "badge-taken", returned: "badge-returned" };
+  const TITLES = {
+    added: n => `Добавлен аккаунт №${n}`,
+    deleted: n => `Удалён аккаунт №${n}`,
+    taken: n => `Аккаунт №${n} взят`,
+    returned: n => `Аккаунт №${n} возвращён`,
+  };
+
+  function escapeHtml(s) {
+    if (s === null || s === undefined) return "";
+    return String(s)
+      .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  }
+
+  function renderItem(item) {
+    const icon = ICONS[item.event_type] || "•";
+    const cls = CLASSES[item.event_type] || "";
+    const titleFn = TITLES[item.event_type] || (n => `Событие №${n}`);
+    const title = titleFn(item.account_id);
+
+    let body = "";
+    if (item.event_type === "added" || item.event_type === "deleted") {
+      const who = item.event_type === "added" ? "Добавил" : "Удалил";
+      body = `
+        <div class="row"><b>Email:</b> ${escapeHtml(item.email)}</div>
+        <div class="row"><b>Пароль:</b> ${escapeHtml(item.password)}</div>
+        <div class="row"><b>Год:</b> ${escapeHtml(item.year)}</div>
+        <div class="row"><b>Описание:</b> ${escapeHtml(item.description || "-")}</div>
+        <div class="meta"><span>${who}: @${escapeHtml(item.username)}</span><span>${escapeHtml(item.created_at)}</span></div>
+      `;
+    } else if (item.event_type === "taken") {
+      body = `<div class="meta"><span>Взял: @${escapeHtml(item.username)}</span><span>${escapeHtml(item.created_at)}</span></div>`;
+    } else if (item.event_type === "returned") {
+      body = `<div class="meta"><span>Вернул: @${escapeHtml(item.username)}</span><span>${escapeHtml(item.created_at)}</span></div>`;
+    }
+
+    return `
+      <div class="card">
+        <div class="card-title ${cls}">${icon} ${escapeHtml(title)}</div>
+        ${body}
+      </div>
+    `;
+  }
+
+  async function load() {
+    const el = document.getElementById("content");
+    try {
+      const res = await fetch("/api/history?limit=300");
+      const items = await res.json();
+      if (!items || items.length === 0) {
+        el.className = "empty";
+        el.textContent = "История пока пуста.";
+        return;
+      }
+      el.className = "";
+      el.innerHTML = items.map(renderItem).join("");
+    } catch (e) {
+      el.className = "empty";
+      el.textContent = "Не удалось загрузить историю. Попробуйте позже.";
+    }
+  }
+
+  load();
+</script>
+</body>
+</html>
