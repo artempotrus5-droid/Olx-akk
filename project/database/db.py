@@ -2,7 +2,9 @@
 """Работа с SQLite: инициализация, атомарные операции над аккаунтами, история."""
 
 import os
+import random
 import sqlite3
+import string
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -79,6 +81,30 @@ def init_db():
                 description TEXT,
                 username TEXT,
                 created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS access_users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                authorized INTEGER NOT NULL DEFAULT 0,
+                is_manager INTEGER NOT NULL DEFAULT 0,
+                is_blocked INTEGER NOT NULL DEFAULT 0,
+                authorized_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS access_codes (
+                code TEXT PRIMARY KEY,
+                created_by INTEGER,
+                created_at TEXT,
+                used INTEGER NOT NULL DEFAULT 0,
+                used_by INTEGER,
+                used_at TEXT
             )
             """
         )
@@ -199,3 +225,106 @@ def list_history(limit=300):
             "SELECT * FROM history ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Доступ: авторизация по одноразовому паролю, менеджеры, блокировки
+# ---------------------------------------------------------------------------
+def touch_user(user_id, username):
+    """Создаёт запись о пользователе при первом контакте, обновляет username."""
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO access_users (user_id, username) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username",
+            (user_id, username),
+        )
+
+
+def is_authorized(user_id) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT authorized FROM access_users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return bool(row and row["authorized"])
+
+
+def is_blocked(user_id) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT is_blocked FROM access_users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return bool(row and row["is_blocked"])
+
+
+def is_manager(user_id) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT is_manager FROM access_users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return bool(row and row["is_manager"])
+
+
+def authorize_user(user_id, username):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE access_users SET authorized = 1, username = ?, authorized_at = ? "
+            "WHERE user_id = ?",
+            (username, now_str(), user_id),
+        )
+
+
+def set_manager(user_id, username, flag: bool):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO access_users (user_id, username, authorized, is_manager) "
+            "VALUES (?, ?, 1, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET is_manager = excluded.is_manager, "
+            "authorized = 1",
+            (user_id, username, 1 if flag else 0),
+        )
+
+
+def set_blocked(user_id, flag: bool):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO access_users (user_id, username, is_blocked) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET is_blocked = excluded.is_blocked",
+            (user_id, "", 1 if flag else 0),
+        )
+
+
+def list_managers():
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM access_users WHERE is_manager = 1"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def create_access_code(admin_id) -> str:
+    code = "".join(random.choices(string.digits, k=6))
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO access_codes (code, created_by, created_at, used) "
+            "VALUES (?, ?, ?, 0)",
+            (code, admin_id, now_str()),
+        )
+    return code
+
+
+def try_use_code(code, user_id, username) -> bool:
+    code = (code or "").strip()
+    if not code or not code.isdigit():
+        return False
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM access_codes WHERE code = ? AND used = 0", (code,)
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            "UPDATE access_codes SET used = 1, used_by = ?, used_at = ? WHERE code = ?",
+            (user_id, now_str(), code),
+        )
+        return True

@@ -17,6 +17,7 @@ import uvicorn
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
+from bot.access import AccessMiddleware
 from bot.handlers import router
 from database import db
 from web.app import app
@@ -34,6 +35,7 @@ async def run_bot():
         return
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
+    dp.message.middleware(AccessMiddleware())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Бот запущен (long polling).")
