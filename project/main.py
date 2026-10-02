@@ -17,7 +17,6 @@ import uvicorn
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from bot.access import AccessMiddleware
 from bot.handlers import router
 from database import db
 from web.app import app
@@ -35,7 +34,6 @@ async def run_bot():
         return
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
-    dp.message.middleware(AccessMiddleware())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Бот запущен (long polling).")
@@ -51,7 +49,7 @@ async def run_web():
 
 async def main():
     db.init_db()
-    logger.info("База данных инициализирована.")
+    logger.info("База данных инициализирована (режим: %s).", "Turso" if db.USE_TURSO else "локальный SQLite")
 
     tasks = [asyncio.create_task(run_web())]
     if BOT_TOKEN:

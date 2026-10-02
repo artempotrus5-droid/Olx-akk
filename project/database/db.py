@@ -1,14 +1,34 @@
 # -*- coding: utf-8 -*-
-"""Работа с SQLite: инициализация, атомарные операции над аккаунтами, история."""
+"""
+Работа с базой данных: атомарные операции над аккаунтами, история.
+
+Поддерживает два режима, определяемые переменными окружения:
+
+1) Локальный SQLite (по умолчанию) — если TURSO_DATABASE_URL не задан.
+   Данные хранятся только в файле на диске контейнера и будут потеряны
+   при пересоздании контейнера на бесплатном тарифе Render.
+
+2) Turso (рекомендуется для продакшена) — если заданы TURSO_DATABASE_URL
+   и TURSO_AUTH_TOKEN. Используется "embedded replica": локальный файл
+   служит быстрым кэшем для чтения, а каждая запись сразу уходит в
+   облачную базу Turso, поэтому данные переживают любой передеплой или
+   пересоздание контейнера.
+"""
 
 import os
-import random
-import sqlite3
-import string
 from contextlib import contextmanager
 from datetime import datetime
 
 DB_PATH = os.getenv("DB_PATH", "data/accounts.db")
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+
+USE_TURSO = bool(TURSO_DATABASE_URL)
+
+if USE_TURSO:
+    import libsql as _driver
+else:
+    import sqlite3 as _driver
 
 EVENT_ADDED = "added"
 EVENT_DELETED = "deleted"
@@ -26,21 +46,43 @@ def _ensure_dir():
         os.makedirs(d, exist_ok=True)
 
 
+def _connect():
+    _ensure_dir()
+    if USE_TURSO:
+        conn = _driver.connect(DB_PATH, sync_url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+        conn.sync()  # подтягиваем актуальное состояние из облака перед работой
+    else:
+        conn = _driver.connect(DB_PATH, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+
 @contextmanager
 def get_conn():
-    _ensure_dir()
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
+    conn = _connect()
     try:
         yield conn
         conn.commit()
+        if USE_TURSO:
+            conn.sync()  # гарантированно проталкиваем изменения в облако
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+
+def _row_to_dict(cursor, row):
+    if row is None:
+        return None
+    cols = [d[0] for d in cursor.description]
+    return dict(zip(cols, row))
+
+
+def _rows_to_dicts(cursor, rows):
+    cols = [d[0] for d in cursor.description]
+    return [dict(zip(cols, r)) for r in rows]
 
 
 def now_str() -> str:
@@ -84,30 +126,6 @@ def init_db():
             )
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS access_users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                authorized INTEGER NOT NULL DEFAULT 0,
-                is_manager INTEGER NOT NULL DEFAULT 0,
-                is_blocked INTEGER NOT NULL DEFAULT 0,
-                authorized_at TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS access_codes (
-                code TEXT PRIMARY KEY,
-                created_by INTEGER,
-                created_at TEXT,
-                used INTEGER NOT NULL DEFAULT 0,
-                used_by INTEGER,
-                used_at TEXT
-            )
-            """
-        )
 
 
 def add_account(email, password, year, description, user_id, username):
@@ -122,31 +140,31 @@ def add_account(email, password, year, description, user_id, username):
             (email, password, year, description, STATUS_FREE, user_id, username, now_str()),
         )
         new_id = cur.lastrowid
-        row = conn.execute("SELECT * FROM accounts WHERE id = ?", (new_id,)).fetchone()
-        return dict(row)
+        cur2 = conn.execute("SELECT * FROM accounts WHERE id = ?", (new_id,))
+        return _row_to_dict(cur2, cur2.fetchone())
 
 
 def get_account(account_id):
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
-        return dict(row) if row else None
+        cur = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
+        return _row_to_dict(cur, cur.fetchone())
 
 
 def list_active_accounts():
     with get_conn() as conn:
-        rows = conn.execute(
+        cur = conn.execute(
             "SELECT * FROM accounts WHERE status != ? ORDER BY id ASC", (STATUS_DELETED,)
-        ).fetchall()
-        return [dict(r) for r in rows]
+        )
+        return _rows_to_dicts(cur, cur.fetchall())
 
 
 def list_user_accounts(user_id):
     with get_conn() as conn:
-        rows = conn.execute(
+        cur = conn.execute(
             "SELECT * FROM accounts WHERE status = ? AND taken_by_user_id = ? ORDER BY id ASC",
             (STATUS_TAKEN, user_id),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        )
+        return _rows_to_dicts(cur, cur.fetchall())
 
 
 def take_account(account_id, user_id, username):
@@ -154,12 +172,13 @@ def take_account(account_id, user_id, username):
     либо (None, conflict_row_or_None) при неудаче."""
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        cur = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
+        row = _row_to_dict(cur, cur.fetchone())
         if row is None:
             return None, None
         if row["status"] != STATUS_FREE:
-            return None, dict(row)
-        conn.execute(
+            return None, row
+        cur2 = conn.execute(
             """
             UPDATE accounts
             SET status = ?, taken_by_user_id = ?, taken_by_username = ?, taken_at = ?
@@ -167,21 +186,22 @@ def take_account(account_id, user_id, username):
             """,
             (STATUS_TAKEN, user_id, username, now_str(), account_id, STATUS_FREE),
         )
-        if conn.total_changes == 0:
-            return None, dict(row)
-        new_row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
-        return dict(new_row), None
+        if cur2.rowcount == 0:
+            return None, row
+        cur3 = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
+        return _row_to_dict(cur3, cur3.fetchone()), None
 
 
 def return_account(account_id, user_id):
     """Возвращает аккаунт, если он числится взятым этим пользователем."""
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        cur = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
+        row = _row_to_dict(cur, cur.fetchone())
         if row is None:
             return None, None
         if row["status"] != STATUS_TAKEN or row["taken_by_user_id"] != user_id:
-            return None, dict(row)
+            return None, row
         conn.execute(
             """
             UPDATE accounts
@@ -190,21 +210,22 @@ def return_account(account_id, user_id):
             """,
             (STATUS_FREE, now_str(), account_id),
         )
-        new_row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
-        return dict(new_row), None
+        cur2 = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
+        return _row_to_dict(cur2, cur2.fetchone()), None
 
 
 def delete_account(account_id):
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        cur = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
+        row = _row_to_dict(cur, cur.fetchone())
         if row is None or row["status"] == STATUS_DELETED:
             return None
         conn.execute(
             "UPDATE accounts SET status = ?, deleted_at = ? WHERE id = ?",
             (STATUS_DELETED, now_str(), account_id),
         )
-        new_row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
-        return dict(new_row)
+        cur2 = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
+        return _row_to_dict(cur2, cur2.fetchone())
 
 
 def add_history(account_id, event_type, email, password, year, description, username):
@@ -221,110 +242,7 @@ def add_history(account_id, event_type, email, password, year, description, user
 
 def list_history(limit=300):
     with get_conn() as conn:
-        rows = conn.execute(
+        cur = conn.execute(
             "SELECT * FROM history ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-
-# ---------------------------------------------------------------------------
-# Доступ: авторизация по одноразовому паролю, менеджеры, блокировки
-# ---------------------------------------------------------------------------
-def touch_user(user_id, username):
-    """Создаёт запись о пользователе при первом контакте, обновляет username."""
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO access_users (user_id, username) VALUES (?, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username",
-            (user_id, username),
         )
-
-
-def is_authorized(user_id) -> bool:
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT authorized FROM access_users WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        return bool(row and row["authorized"])
-
-
-def is_blocked(user_id) -> bool:
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT is_blocked FROM access_users WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        return bool(row and row["is_blocked"])
-
-
-def is_manager(user_id) -> bool:
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT is_manager FROM access_users WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        return bool(row and row["is_manager"])
-
-
-def authorize_user(user_id, username):
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE access_users SET authorized = 1, username = ?, authorized_at = ? "
-            "WHERE user_id = ?",
-            (username, now_str(), user_id),
-        )
-
-
-def set_manager(user_id, username, flag: bool):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO access_users (user_id, username, authorized, is_manager) "
-            "VALUES (?, ?, 1, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET is_manager = excluded.is_manager, "
-            "authorized = 1",
-            (user_id, username, 1 if flag else 0),
-        )
-
-
-def set_blocked(user_id, flag: bool):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO access_users (user_id, username, is_blocked) VALUES (?, ?, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET is_blocked = excluded.is_blocked",
-            (user_id, "", 1 if flag else 0),
-        )
-
-
-def list_managers():
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM access_users WHERE is_manager = 1"
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-
-def create_access_code(admin_id) -> str:
-    code = "".join(random.choices(string.digits, k=6))
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO access_codes (code, created_by, created_at, used) "
-            "VALUES (?, ?, ?, 0)",
-            (code, admin_id, now_str()),
-        )
-    return code
-
-
-def try_use_code(code, user_id, username) -> bool:
-    code = (code or "").strip()
-    if not code or not code.isdigit():
-        return False
-    with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT * FROM access_codes WHERE code = ? AND used = 0", (code,)
-        ).fetchone()
-        if row is None:
-            return False
-        conn.execute(
-            "UPDATE access_codes SET used = 1, used_by = ?, used_at = ? WHERE code = ?",
-            (user_id, now_str(), code),
-        )
-        return True
+        return _rows_to_dicts(cur, cur.fetchall())

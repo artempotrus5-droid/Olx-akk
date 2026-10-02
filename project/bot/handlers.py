@@ -25,7 +25,6 @@ from bot.keyboards import (
     main_menu,
 )
 from bot.states import AddAccount, DeleteAccount, ReturnAccount, TakeAccount
-from bot.access import is_admin
 from database import db
 
 router = Router()
@@ -52,107 +51,16 @@ async def send_long(message: Message, chunks, **kwargs):
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    text = (
+    await message.answer(
         "👋 Привет! Это внутренний бот учёта корпоративных OLX-аккаунтов.\n\n"
         "➕ Добавить аккаунт — добавить новый аккаунт в общий пул\n"
         "📋 Взять аккаунт — посмотреть список и занять свободный\n"
         "🔄 Вернуть аккаунт — вернуть аккаунт, который вы сейчас используете\n"
         "🗑 Удалить аккаунт — удалить аккаунт из пула\n"
         "📖 История аккаунтов — журнал всех действий\n\n"
-        "Выберите действие в меню ниже."
+        "Выберите действие в меню ниже.",
+        reply_markup=main_menu(),
     )
-    if is_admin(message.from_user.id):
-        text += (
-            "\n\n🛠 Админ-команды:\n"
-            "/genpass — выдать одноразовый пароль на вход\n"
-            "/addmanager <telegram_id> — разрешить пользователю добавлять аккаунты\n"
-            "/delmanager <telegram_id> — забрать право добавлять аккаунты\n"
-            "/managers — список менеджеров\n"
-            "/block <telegram_id> — заблокировать пользователя\n"
-            "/unblock <telegram_id> — разблокировать пользователя"
-        )
-    await message.answer(text, reply_markup=main_menu())
-
-
-# ---------------------------------------------------------------------------
-# Админ-команды: доступ, менеджеры, блокировки
-# ---------------------------------------------------------------------------
-def _parse_target_id(args: str):
-    if not args:
-        return None
-    args = args.strip().lstrip("@")
-    return int(args) if args.isdigit() else None
-
-
-@router.message(Command("genpass"))
-async def cmd_genpass(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    code = db.create_access_code(message.from_user.id)
-    await message.answer(
-        f"🔑 Одноразовый пароль: {code}\n\n"
-        "Передайте его человеку, которому нужен доступ. Пароль сработает только один раз."
-    )
-
-
-@router.message(Command("addmanager"))
-async def cmd_addmanager(message: Message, command):
-    if not is_admin(message.from_user.id):
-        return
-    uid = _parse_target_id(command.args)
-    if uid is None:
-        await message.answer("Использование: /addmanager <telegram_id>")
-        return
-    db.set_manager(uid, str(uid), True)
-    await message.answer(f"✅ Пользователь {uid} теперь может добавлять аккаунты.")
-
-
-@router.message(Command("delmanager"))
-async def cmd_delmanager(message: Message, command):
-    if not is_admin(message.from_user.id):
-        return
-    uid = _parse_target_id(command.args)
-    if uid is None:
-        await message.answer("Использование: /delmanager <telegram_id>")
-        return
-    db.set_manager(uid, str(uid), False)
-    await message.answer(f"✅ Пользователь {uid} больше не может добавлять аккаунты.")
-
-
-@router.message(Command("managers"))
-async def cmd_managers(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    rows = db.list_managers()
-    if not rows:
-        await message.answer("Менеджеров пока нет.")
-        return
-    lines = [f"{r['user_id']} (@{r['username']})" for r in rows]
-    await message.answer("Менеджеры:\n" + "\n".join(lines))
-
-
-@router.message(Command("block"))
-async def cmd_block(message: Message, command):
-    if not is_admin(message.from_user.id):
-        return
-    uid = _parse_target_id(command.args)
-    if uid is None:
-        await message.answer("Использование: /block <telegram_id>")
-        return
-    db.set_blocked(uid, True)
-    await message.answer(f"🚫 Пользователь {uid} заблокирован.")
-
-
-@router.message(Command("unblock"))
-async def cmd_unblock(message: Message, command):
-    if not is_admin(message.from_user.id):
-        return
-    uid = _parse_target_id(command.args)
-    if uid is None:
-        await message.answer("Использование: /unblock <telegram_id>")
-        return
-    db.set_blocked(uid, False)
-    await message.answer(f"✅ Пользователь {uid} разблокирован.")
 
 
 @router.message(Command("cancel"))
@@ -171,13 +79,6 @@ async def cancel_any(message: Message, state: FSMContext):
 # ---------------------------------------------------------------------------
 @router.message(StateFilter(None), F.text == BTN_ADD)
 async def add_start(message: Message, state: FSMContext):
-    uid = message.from_user.id
-    if not (is_admin(uid) or db.is_manager(uid)):
-        await message.answer(
-            "⛔ У вас нет прав на добавление аккаунтов. Обратитесь к администратору.",
-            reply_markup=main_menu(),
-        )
-        return
     await state.set_state(AddAccount.email)
     await message.answer(
         "➕ Добавить аккаунт\n\nШаг 1 из 3\nОтправьте email аккаунта:",
